@@ -1,20 +1,14 @@
-from pathlib import Path
 from datetime import date
 
 import pandas as pd
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 # ==================================================
 # 基本設定
 # ==================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-
-LOG_PATH = DATA_DIR / "market_logs.csv"
-
 
 st.set_page_config(
     page_title="株研究 相場観察アプリ",
@@ -22,7 +16,91 @@ st.set_page_config(
 )
 
 st.title("株研究 相場観察アプリ")
-st.caption("選択式で相場観察を記録します。まずは最小版です。")
+st.caption("選択式で相場観察を記録し、Googleスプレッドシートに保存します。")
+
+
+# ==================================================
+# Google Sheets 接続設定
+# ==================================================
+
+SHEET_NAME = "market_logs"
+
+HEADERS = [
+    "date",
+    "nikkei_direction",
+    "nikkei_strength",
+    "nikkei_ma",
+    "nikkei_memo",
+    "growth_strength",
+    "growth_vs_nikkei",
+    "small_stock_flow",
+    "growth_memo",
+    "themes",
+    "theme_memo",
+    "code",
+    "stock_name",
+    "reason",
+    "chart_features",
+    "stock_memo",
+    "today_learning",
+    "tomorrow_watch",
+]
+
+
+@st.cache_resource
+def get_worksheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes,
+    )
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet_id = st.secrets["SPREADSHEET_ID"]
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    try:
+        worksheet = spreadsheet.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=SHEET_NAME,
+            rows=1000,
+            cols=len(HEADERS),
+        )
+
+    values = worksheet.get_all_values()
+
+    if not values:
+        worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
+    elif values[0] != HEADERS:
+        worksheet.clear()
+        worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
+
+    return worksheet
+
+
+def load_logs():
+    worksheet = get_worksheet()
+    records = worksheet.get_all_records()
+
+    if not records:
+        return pd.DataFrame(columns=HEADERS)
+
+    return pd.DataFrame(records)
+
+
+def save_log(row):
+    worksheet = get_worksheet()
+
+    worksheet.append_row(
+        [row.get(col, "") for col in HEADERS],
+        value_input_option="USER_ENTERED",
+    )
 
 
 # ==================================================
@@ -83,7 +161,7 @@ with col2:
 
 
 # ==================================================
-# テーマ
+# テーマ観察
 # ==================================================
 
 st.header("2. テーマ観察")
@@ -115,7 +193,7 @@ theme_memo = st.text_area(
 
 
 # ==================================================
-# 個別銘柄
+# 個別銘柄チェック
 # ==================================================
 
 st.header("3. 個別銘柄チェック")
@@ -156,6 +234,8 @@ stock_memo = st.text_area(
     "個別銘柄の感想",
     placeholder="例：決算後にGU。その後も高値圏を維持しているが、すでに上がった後に見える。"
 )
+
+
 # ==================================================
 # チャート画像アップロード
 # ==================================================
@@ -164,7 +244,7 @@ st.header("4. チャート画像")
 
 uploaded_file = st.file_uploader(
     "チャート画像をアップロード",
-    type=["png", "jpg", "jpeg"]
+    type=["png", "jpg", "jpeg", "webp"]
 )
 
 if uploaded_file is not None:
@@ -175,6 +255,7 @@ if uploaded_file is not None:
     )
 
     st.success("チャート画像を読み込みました。")
+
 
 # ==================================================
 # ChatGPT答え合わせ用テキスト生成
@@ -284,6 +365,7 @@ if st.button("ChatGPT答え合わせ用テキストを作成"):
         height=600
     )
 
+
 # ==================================================
 # 今日の気づき
 # ==================================================
@@ -307,7 +389,7 @@ tomorrow_watch = st.text_area(
 
 st.header("7. 保存")
 
-if st.button("観察ログを保存"):
+if st.button("Googleスプレッドシートに保存"):
     row = {
         "date": str(log_date),
         "nikkei_direction": nikkei_direction,
@@ -329,19 +411,12 @@ if st.button("観察ログを保存"):
         "tomorrow_watch": tomorrow_watch,
     }
 
-    if LOG_PATH.exists():
-        df = pd.read_csv(LOG_PATH)
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    else:
-        df = pd.DataFrame([row])
-
-    df.to_csv(LOG_PATH, index=False, encoding="utf-8-sig")
-
-    st.success("保存しました。")
-    st.info(f"保存先：{LOG_PATH}")
-
-    st.subheader("直近の観察ログ")
-    st.dataframe(df.tail(10), use_container_width=True)
+    try:
+        save_log(row)
+        st.success("Googleスプレッドシートに保存しました。")
+    except Exception as e:
+        st.error("保存に失敗しました。")
+        st.exception(e)
 
 
 # ==================================================
@@ -350,9 +425,15 @@ if st.button("観察ログを保存"):
 
 st.header("8. 過去ログ")
 
-if LOG_PATH.exists():
+if st.button("過去ログを読み込む"):
     try:
-        df_log = pd.read_csv(LOG_PATH)
-        st.dataframe(df_log.tail(20), use_container_width=True)
+        df_log = load_logs()
+
+        if df_log.empty:
+            st.info("まだ保存された観察ログはありません。")
+        else:
+            st.dataframe(df_log.tail(20), use_container_width=True)
+
     except Exception as e:
-        st.warning(f"過去ログを読み込めませんでした：{e}")
+        st.error("過去ログの読み込みに失敗しました。")
+        st.exception(e)
